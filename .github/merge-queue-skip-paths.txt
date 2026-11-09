@@ -1,0 +1,9 @@
+# Extended regexes (grep -E), one per line, matched against each changed file path.
+# If EVERY file in a merge group matches, the merge queue skips the integration tests.
+# Read from the base branch, so a queued PR cannot change its own skip list.
+\.md$
+^docs/
+^LICENSE
+^\.github/ISSUE_TEMPLATE/
+^\.github/PULL_REQUEST_TEMPLATE
+^\.github/CODEOWNERS$

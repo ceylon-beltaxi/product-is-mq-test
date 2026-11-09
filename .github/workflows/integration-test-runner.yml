@@ -19,8 +19,56 @@ env:
   MAVEN_OPTS: -Dhttp.keepAlive=false -Dmaven.wagon.http.pool=false -Dmaven.wagon.http.retryHandler.class=standard -Dmaven.wagon.http.retryHandler.count=3 -Djdk.util.zip.disableZip64ExtraFieldValidation=true -XX:+HeapDumpOnOutOfMemoryError
 
 jobs:
+  # merge_group does not support `paths` filters, so decide here whether the
+  # queued change needs the integration tests at all. Files matching a regex in
+  # .github/merge-queue-skip-paths.txt are ignored; if every changed file is
+  # ignored the heavy matrix is skipped and the required check still passes.
+  changes:
+    name: Detect test-relevant changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      run_tests: ${{ steps.filter.outputs.run_tests }}
+    steps:
+      - name: Check changed files
+        id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: |
+          if [ "$EVENT" != "merge_group" ]; then
+            echo "run_tests=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # Skip list is read from the base branch, so a queued PR cannot widen it.
+          gh api "repos/$GITHUB_REPOSITORY/contents/.github/merge-queue-skip-paths.txt?ref=$BASE_SHA" \
+            -H "Accept: application/vnd.github.raw" > skip.txt || : > skip.txt
+          grep -vE '^\s*(#|$)' skip.txt > patterns.txt || true
+          gh api --paginate "repos/$GITHUB_REPOSITORY/compare/$BASE_SHA...$HEAD_SHA" \
+            --jq '.files[] | .filename, (.previous_filename // empty)' > changed.txt
+          echo "Changed files:"; cat changed.txt
+          if [ ! -s changed.txt ]; then
+            echo "Could not list changed files; running tests to be safe."
+            echo "run_tests=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ -s patterns.txt ]; then
+            relevant=$(grep -vE -f patterns.txt changed.txt || true)
+          else
+            relevant=$(cat changed.txt)
+          fi
+          if [ -n "$relevant" ]; then
+            echo "Test-relevant files:"; echo "$relevant"
+            echo "run_tests=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Only skip-listed files changed; integration tests skipped."
+            echo "run_tests=false" >> "$GITHUB_OUTPUT"
+          fi
+
   run-test-runners:
-    if: ${{ github.event_name != 'pull_request' }}
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.run_tests == 'true' }}
     runs-on: ${{ github.repository == 'wso2/product-is' && fromJSON(format('["codebuild-wso2_product-is-{0}-{1}"]', github.run_id, github.run_attempt)) || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
@@ -144,7 +192,7 @@ jobs:
     # matrix is skipped there) and for merge_group (green only if every runner
     # passed).
     name: Integration Tests
-    needs: run-test-runners
+    needs: [changes, run-test-runners]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -155,6 +203,10 @@ jobs:
           echo "run-test-runners result: $result"
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             echo "Integration tests run in the merge queue, not on the PR."
+            exit 0
+          fi
+          if [ "${{ needs.changes.outputs.run_tests }}" = "false" ]; then
+            echo "Only skip-listed files changed; integration tests were not required."
             exit 0
           fi
           if [ "$result" != "success" ]; then
